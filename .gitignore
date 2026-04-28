@@ -1,0 +1,3 @@
+docs/
+.venv/
+echo "*.mp4" >> .gitignore
