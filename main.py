@@ -62,7 +62,7 @@ def init_pose_estimator():
         base_options=base_options,
         running_mode=mp_vision.RunningMode.IMAGE,
         num_poses=1,
-        min_detection_confidence=0.5,
+        min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         output_segmentation_masks=False,
     )
