@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -28,14 +29,15 @@ OFFSETS_SEC = {
     "stage4.mp4": 0.0,
 }
 
-# Phase 1: analysis unit is parameterized in seconds.
+# Analysis unit is parameterized in seconds.
 ANALYSIS_STEP_SEC = 0.5
 MIN_SCENE_LEN_SEC = 2.0
 SWITCH_THRESHOLD = 0.15
 
-# Phase 1: preprocessing targets.
+# Preprocessing targets.
 # If None, keep original. If tuple, normalize all analysis frames to this size.
 TARGET_RESOLUTION: Optional[Tuple[int, int]] = (1280, 720)
+DEBUG_SAMPLE_COUNT = 12
 
 
 def init_face_detector():
@@ -250,6 +252,94 @@ def extract_pose_keypoints(frame: np.ndarray, pose_estimator) -> Optional[np.nda
     return np.array(keypoints, dtype=np.float32)
 
 
+def normalize_pose_keypoints(keypoints: np.ndarray) -> Optional[np.ndarray]:
+    if keypoints.shape != (33, 4):
+        return None
+
+    normalized = keypoints.copy()
+    hips = normalized[[23, 24], :3]
+    center = hips.mean(axis=0)
+    normalized[:, :3] -= center
+
+    shoulders = normalized[[11, 12], :3]
+    torso_points = np.vstack([hips - center, shoulders])
+    scale = float(np.max(np.linalg.norm(torso_points, axis=1)))
+    if scale <= 1e-6:
+        return None
+
+    normalized[:, :3] /= scale
+    return normalized
+
+
+def pose_similarity(a: np.ndarray, b: np.ndarray, normalize: bool = False) -> Optional[float]:
+    if normalize:
+        a = normalize_pose_keypoints(a)
+        b = normalize_pose_keypoints(b)
+        if a is None or b is None:
+            return None
+
+    visible = (a[:, 3] >= 0.5) & (b[:, 3] >= 0.5)
+    if int(np.sum(visible)) < 8:
+        return None
+
+    va = a[visible, :3].reshape(-1)
+    vb = b[visible, :3].reshape(-1)
+    denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+    if denom <= 1e-6:
+        return None
+
+    return float(np.dot(va, vb) / denom)
+
+
+def build_debug_times(total_sec: float, sample_count: int = DEBUG_SAMPLE_COUNT) -> List[float]:
+    if sample_count <= 0:
+        raise ValueError("sample_count must be > 0.")
+    if total_sec <= 0:
+        raise ValueError("total_sec must be > 0.")
+
+    end = max(0.0, total_sec - 1.0)
+    if sample_count == 1:
+        return [0.0]
+    return [float(t) for t in np.linspace(0.0, end, sample_count)]
+
+
+def load_validated_context():
+    config = load_pipeline_config()
+    validate_config(config)
+    metas = collect_video_meta(config)
+    total_sec = common_timeline_duration(metas)
+    return config, metas, total_sec
+
+
+def collect_pose_samples(
+    config: PipelineConfig,
+    metas: List[VideoMeta],
+    sample_times: List[float],
+) -> List[List[Optional[np.ndarray]]]:
+    caps = [cv2.VideoCapture(meta.path) for meta in metas]
+    pose_estimator = init_pose_estimator()
+    print("pose estimator ready:", pose_estimator is not None)
+    samples: List[List[Optional[np.ndarray]]] = []
+
+    try:
+        for t in sample_times:
+            row: List[Optional[np.ndarray]] = []
+            for cap, meta in zip(caps, metas):
+                frame = read_synced_frame(cap, meta, t, config.target_resolution)
+                if frame is None:
+                    row.append(None)
+                    continue
+                row.append(extract_pose_keypoints(frame, pose_estimator))
+            samples.append(row)
+    finally:
+        if pose_estimator is not None:
+            pose_estimator.close()
+        for cap in caps:
+            cap.release()
+
+    return samples
+
+
 def detect_face_bboxes(frame: np.ndarray, detector_kind: str, detector) -> List[Tuple[float, float, float, float]]:
     h, w = frame.shape[:2]
     if w <= 0 or h <= 0:
@@ -420,7 +510,7 @@ def build_video(segments, config: PipelineConfig, total_sec: float):
 
 
 def print_preprocess_summary(config: PipelineConfig, metas: List[VideoMeta], total_sec: float):
-    print("=== Preprocess Summary (Phase 1) ===")
+    print("=== Preprocess Summary ===")
     print("videos:", len(config.video_paths))
     print("analysis_step_sec:", config.analysis_step_sec)
     print("target_resolution:", config.target_resolution)
@@ -475,5 +565,156 @@ def main():
     print("done:", config.output_path)
 
 
+def run_pose_debug():
+    run_start = time.perf_counter()
+    print("pose debug started")
+
+    config, metas, total_sec = load_validated_context()
+    print_preprocess_summary(config, metas, total_sec)
+    sample_times = build_debug_times(total_sec)
+    samples = collect_pose_samples(config, metas, sample_times)
+
+    checked = 0
+    detected = 0
+    visibility_scores = []
+
+    for t, row in zip(sample_times, samples):
+        print(f"time={t:.2f}s")
+        for cam_idx, keypoints in enumerate(row):
+            checked += 1
+            if keypoints is None:
+                print(f"  cam={cam_idx} detected=False")
+                continue
+
+            detected += 1
+            mean_visibility = float(np.mean(keypoints[:, 3]))
+            visibility_scores.append(mean_visibility)
+            print(
+                f"  cam={cam_idx} detected=True "
+                f"shape={keypoints.shape} mean_visibility={mean_visibility:.3f}"
+            )
+
+    rate = detected / checked if checked else 0.0
+    avg_visibility = float(np.mean(visibility_scores)) if visibility_scores else 0.0
+    print(f"pose detection: {detected}/{checked} ({rate:.1%})")
+    print(f"average visibility: {avg_visibility:.3f}")
+    print("pose debug elapsed:", format_elapsed(time.perf_counter() - run_start))
+
+
+def run_similarity_debug():
+    run_start = time.perf_counter()
+    print("similarity debug started")
+
+    config, metas, total_sec = load_validated_context()
+    print_preprocess_summary(config, metas, total_sec)
+    sample_times = build_debug_times(total_sec)
+    samples = collect_pose_samples(config, metas, sample_times)
+
+    positive_raw = []
+    positive_norm = []
+    negative_norm = []
+
+    for row in samples:
+        for i in range(len(row)):
+            for j in range(i + 1, len(row)):
+                if row[i] is None or row[j] is None:
+                    continue
+                raw = pose_similarity(row[i], row[j], normalize=False)
+                norm = pose_similarity(row[i], row[j], normalize=True)
+                if raw is not None:
+                    positive_raw.append(raw)
+                if norm is not None:
+                    positive_norm.append(norm)
+
+    for prev, cur in zip(samples, samples[1:]):
+        for cam_idx in range(len(cur)):
+            if prev[cam_idx] is None or cur[cam_idx] is None:
+                continue
+            norm = pose_similarity(prev[cam_idx], cur[cam_idx], normalize=True)
+            if norm is not None:
+                negative_norm.append(norm)
+
+    def mean_or_none(values: List[float]) -> Optional[float]:
+        return float(np.mean(values)) if values else None
+
+    positive_raw_mean = mean_or_none(positive_raw)
+    positive_norm_mean = mean_or_none(positive_norm)
+    negative_norm_mean = mean_or_none(negative_norm)
+    gap = (
+        positive_norm_mean - negative_norm_mean
+        if positive_norm_mean is not None and negative_norm_mean is not None
+        else None
+    )
+
+    print(f"positive_raw_pairs: {len(positive_raw)}")
+    print(f"positive_normalized_pairs: {len(positive_norm)}")
+    print(f"negative_normalized_pairs: {len(negative_norm)}")
+    print(f"positive_raw_mean: {positive_raw_mean}")
+    print(f"positive_normalized_mean: {positive_norm_mean}")
+    print(f"negative_normalized_mean: {negative_norm_mean}")
+    print(f"gap: {gap}")
+    print("similarity debug elapsed:", format_elapsed(time.perf_counter() - run_start))
+
+
+def run_selection_debug():
+    run_start = time.perf_counter()
+    print("selection debug started")
+
+    config, metas, total_sec = load_validated_context()
+    print_preprocess_summary(config, metas, total_sec)
+    sample_times = build_debug_times(total_sec)
+
+    caps = [cv2.VideoCapture(meta.path) for meta in metas]
+    detector_kind, detector = init_face_detector()
+    print("detector ready:", detector_kind)
+
+    scores: List[List[float]] = []
+    try:
+        for t in sample_times:
+            row = []
+            for cap, meta in zip(caps, metas):
+                frame = read_synced_frame(cap, meta, t, config.target_resolution)
+                row.append(score_frame(frame, detector_kind, detector) if frame is not None else 0.0)
+            scores.append(row)
+            best = int(np.argmax(row))
+            score_text = ", ".join(f"cam{i}={score:.3f}" for i, score in enumerate(row))
+            print(f"time={t:.2f}s best_cam={best} scores=[{score_text}]")
+    finally:
+        if detector_kind == "mediapipe" and hasattr(detector, "close"):
+            detector.close()
+        for cap in caps:
+            cap.release()
+
+    chosen = select_camera(sample_times, scores, config)
+    segments = make_segments(sample_times, chosen, sample_times[-1])
+    print("selected camera sequence:", chosen)
+    print("debug segments:")
+    for cam, start_sec, end_sec in segments:
+        print(f"  cam={cam} start={start_sec:.2f}s end={end_sec:.2f}s")
+    print("selection debug elapsed:", format_elapsed(time.perf_counter() - run_start))
+
+
+def print_usage():
+    print("usage: python main.py [pose-debug|similarity-debug|selection-debug|full]")
+    print("  pose-debug: pose keypoint extraction debug only")
+    print("  similarity-debug: pose similarity debug only")
+    print("  selection-debug: camera selection debug only")
+    print("  full: full analyze + render pipeline")
+
+
+def run_cli():
+    command = sys.argv[1] if len(sys.argv) > 1 else "full"
+    commands = {
+        "pose-debug": run_pose_debug,
+        "similarity-debug": run_similarity_debug,
+        "selection-debug": run_selection_debug,
+        "full": main,
+    }
+    if command not in commands:
+        print_usage()
+        raise SystemExit(f"unknown command: {command}")
+    commands[command]()
+
+
 if __name__ == "__main__":
-    main()
+    run_cli()
