@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import mediapipe as mp
 import numpy as np
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
 from moviepy import VideoFileClip, concatenate_videoclips
 
 
@@ -16,6 +18,7 @@ VIDEO_PATHS = [
 ]
 
 OUTPUT_PATH = "edited_output.mp4"
+POSE_MODEL_PATH = "pose_landmarker_lite.task"
 
 OFFSETS_SEC = {
     "stage1.mp4": 4.0,
@@ -47,6 +50,23 @@ def init_face_detector():
     if cascade.empty():
         raise RuntimeError("Failed to load OpenCV Haar cascade face detector.")
     return "haar", cascade
+
+
+def init_pose_estimator():
+    if not os.path.exists(POSE_MODEL_PATH):
+        print(f"pose model missing: {POSE_MODEL_PATH}")
+        return None
+
+    base_options = mp_tasks.BaseOptions(model_asset_path=POSE_MODEL_PATH)
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        output_segmentation_masks=False,
+    )
+    return mp_vision.PoseLandmarker.create_from_options(options)
 
 
 @dataclass(frozen=True)
@@ -212,6 +232,23 @@ def sharpness(gray: np.ndarray) -> float:
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
+def extract_pose_keypoints(frame: np.ndarray, pose_estimator) -> Optional[np.ndarray]:
+    if pose_estimator is None:
+        return None
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    results = pose_estimator.detect(image)
+    if not results.pose_landmarks:
+        return None
+
+    keypoints = []
+    for landmark in results.pose_landmarks[0]:
+        visibility = getattr(landmark, "visibility", 1.0)
+        keypoints.append((landmark.x, landmark.y, landmark.z, visibility))
+    return np.array(keypoints, dtype=np.float32)
+
+
 def detect_face_bboxes(frame: np.ndarray, detector_kind: str, detector) -> List[Tuple[float, float, float, float]]:
     h, w = frame.shape[:2]
     if w <= 0 or h <= 0:
@@ -272,21 +309,41 @@ def analyze(config: PipelineConfig, metas: List[VideoMeta]):
 
     detector_kind, detector = init_face_detector()
     print("detector ready:", detector_kind)
+    pose_estimator = init_pose_estimator()
+    pose_enabled = pose_estimator is not None
+    pose_checked = 0
+    pose_detected = 0
+    print("pose estimator ready:", pose_enabled)
     try:
         for t in timeline:
             print("analyzing time:", round(t, 2))
             row = []
             for cap, meta in zip(caps, metas):
                 frame = read_synced_frame(cap, meta, t, config.target_resolution)
-                row.append(0.0 if frame is None else score_frame(frame, detector_kind, detector))
+                if frame is None:
+                    row.append(0.0)
+                    continue
+
+                pose_keypoints = extract_pose_keypoints(frame, pose_estimator)
+                pose_checked += 1
+                if pose_keypoints is not None:
+                    pose_detected += 1
+
+                row.append(score_frame(frame, detector_kind, detector))
             times.append(t)
             scores.append(row)
     finally:
         if detector_kind == "mediapipe" and hasattr(detector, "close"):
             detector.close()
+        if pose_estimator is not None:
+            pose_estimator.close()
 
     for cap in caps:
         cap.release()
+
+    if pose_checked:
+        rate = pose_detected / pose_checked
+        print(f"pose detection: {pose_detected}/{pose_checked} ({rate:.1%})")
 
     return times, scores, total_sec
 
