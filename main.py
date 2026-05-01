@@ -1,4 +1,5 @@
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -431,26 +432,46 @@ def print_preprocess_summary(config: PipelineConfig, metas: List[VideoMeta], tot
         )
 
 
+def format_elapsed(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    remain = seconds - minutes * 60
+    return f"{minutes}m {remain:.1f}s"
+
+
 def main():
+    run_start = time.perf_counter()
     print("main started")
 
+    step_start = time.perf_counter()
     config = load_pipeline_config()
     validate_config(config)
     metas = collect_video_meta(config)
     total_sec = common_timeline_duration(metas)
     print_preprocess_summary(config, metas, total_sec)
+    print("preprocess elapsed:", format_elapsed(time.perf_counter() - step_start))
 
+    step_start = time.perf_counter()
     times, scores, total_sec = analyze(config, metas)
     print("analysis finished")
+    print("analysis elapsed:", format_elapsed(time.perf_counter() - step_start))
 
+    step_start = time.perf_counter()
     chosen = select_camera(times, scores, config)
     print("camera selection finished")
+    print("camera selection elapsed:", format_elapsed(time.perf_counter() - step_start))
 
+    step_start = time.perf_counter()
     segments = make_segments(times, chosen, total_sec)
     print("segment generation finished")
+    print("segment generation elapsed:", format_elapsed(time.perf_counter() - step_start))
 
+    step_start = time.perf_counter()
     print("video rendering started")
     build_video(segments, config, total_sec)
+    print("video rendering elapsed:", format_elapsed(time.perf_counter() - step_start))
+
+    total_elapsed = time.perf_counter() - run_start
+    print("total elapsed:", format_elapsed(total_elapsed))
     print("done:", config.output_path)
 
 
