@@ -18,9 +18,9 @@ VIDEO_PATHS = [
 OUTPUT_PATH = "edited_output.mp4"
 
 OFFSETS_SEC = {
-    "stage1.mp4": 3.5,
-    "stage2.mp4": 29.5,
-    "stage3.mp4": 0.1,
+    "stage1.mp4": 4.0,
+    "stage2.mp4": 29.0,
+    "stage3.mp4": 0.0,
     "stage4.mp4": 0.0,
 }
 
@@ -332,7 +332,7 @@ def make_segments(times: List[float], chosen: List[int], total_sec: float):
     return segments
 
 
-def build_video(segments, config: PipelineConfig):
+def build_video(segments, config: PipelineConfig, total_sec: float):
     clips = [VideoFileClip(path) for path in config.video_paths]
     output_clips = []
 
@@ -347,9 +347,10 @@ def build_video(segments, config: PipelineConfig):
 
     final = concatenate_videoclips(output_clips)
 
+    offset = config.offsets_sec[config.video_paths[0]]
     base_audio = clips[0].subclipped(
-        config.offsets_sec[config.video_paths[0]],
-        config.offsets_sec[config.video_paths[0]] + segments[-1][2],
+        offset,
+        offset + total_sec,
     ).audio
     final = final.with_audio(base_audio)
 
@@ -392,7 +393,7 @@ def main():
     print("segment generation finished")
 
     print("video rendering started")
-    build_video(segments, config)
+    build_video(segments, config, total_sec)
     print("done:", config.output_path)
 
 
